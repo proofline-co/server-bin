@@ -1,4 +1,4 @@
-name: Compile and Release Binaries
+name: Compile and Release Binaries (Optimized Matrix)
 
 on:
   repository_dispatch:
@@ -6,24 +6,30 @@ on:
   workflow_dispatch:
     inputs:
       tag_name:
-        description: "Nombre del release o tag (ej: v1.0.0)"
+        description: "Release tag (e.g. v1.0.0)"
         required: false
         default: ""
       source_ref:
-        description: "Rama o commit en proofline-co/server a compilar"
+        description: "Branch or commit in proofline-co/server to compile"
         required: false
         default: "main"
+
+concurrency:
+  group: release-${{ github.event.client_payload.ref || inputs.source_ref || github.ref }}
+  cancel-in-progress: true
 
 permissions:
   contents: write
 
 jobs:
-  build-and-release:
-    name: Build and Publish Releases
+  prepare-meta:
+    name: Resolve Version & Metadata
     runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.meta.outputs.tag }}
+      source_ref: ${{ steps.meta.outputs.source_ref }}
     steps:
-      - name: Calculate Release Tag and Source Ref
-        id: vars
+      - id: meta
         run: |
           if [ -n "${{ github.event.client_payload.tag }}" ]; then
             TAG="${{ github.event.client_payload.tag }}"
@@ -43,79 +49,110 @@ jobs:
 
           echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
           echo "source_ref=${SOURCE_REF}" >> "$GITHUB_OUTPUT"
-          echo "Release Tag: ${TAG}"
-          echo "Source Ref: ${SOURCE_REF}"
+          echo "Building: tag=${TAG}, source_ref=${SOURCE_REF}"
 
-      - name: Checkout Private Source Repository
+  build-matrix:
+    name: Build (${{ matrix.target.name }})
+    needs: prepare-meta
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - { name: "linux-x64", bun_target: "bun-linux-x64", outfile: "proofline-server-linux-x64" }
+          - { name: "linux-arm64", bun_target: "bun-linux-arm64", outfile: "proofline-server-linux-arm64" }
+          - { name: "windows-x64", bun_target: "bun-windows-x64", outfile: "proofline-server-windows-x64.exe" }
+    steps:
+      - name: Checkout Source Repo
         uses: actions/checkout@v4
         with:
           repository: proofline-co/server
-          ref: ${{ steps.vars.outputs.source_ref }}
+          ref: ${{ needs.prepare-meta.outputs.source_ref }}
           token: ${{ secrets.SERVER_SOURCE_TOKEN || secrets.GH_PAT || secrets.GITHUB_TOKEN }}
           path: source-repo
 
-      - name: Setup Bun Runtime
+      - name: Setup Bun with Cache
         uses: oven-sh/setup-bun@v2
         with:
           bun-version: latest
+          cache: true
 
-      - name: Verify Source and Execute Test Suite
+      - name: Install & Run Test Suite
         working-directory: source-repo
         env:
           NODE_ENV: test
           DB_ENGINE: memory
         run: |
           bun install --frozen-lockfile || bun install
-          bun test --parallel=1 --timeout 15000
+          if [ "${{ matrix.target.name }}" = "linux-x64" ]; then
+            echo "Running test suite once on primary runner..."
+            bun test --parallel=1 --timeout 15000
+          fi
 
-      - name: Compile Standalone Binaries
+      - name: Compile Standalone Binary
         working-directory: source-repo
         run: |
           mkdir -p ../dist
           ENTRY=$(test -f ./apps/api/src/server.ts && echo "./apps/api/src/server.ts" || echo "./src/server.ts")
-          echo "Compilando desde entrypoint: $ENTRY"
+          echo "Compiling for ${{ matrix.target.bun_target }} from $ENTRY..."
+          bun build --compile --minify --target=${{ matrix.target.bun_target }} "$ENTRY" --outfile ../dist/${{ matrix.target.outfile }}
 
-          echo "Compilando ejecutable para Linux x64..."
-          bun build --compile --minify --target=bun-linux-x64 "$ENTRY" --outfile ../dist/proofline-server-linux-x64
-
-          echo "Compilando ejecutable para Linux ARM64..."
-          bun build --compile --minify --target=bun-linux-arm64 "$ENTRY" --outfile ../dist/proofline-server-linux-arm64
-
-          echo "Compilando ejecutable para Windows x64..."
-          bun build --compile --minify --target=bun-windows-x64 "$ENTRY" --outfile ../dist/proofline-server-windows-x64.exe
-
-      - name: Generate Checksums
-        working-directory: dist
+      - name: Binary Smoke Check (Linux x64 only)
+        if: matrix.target.name == 'linux-x64'
         run: |
+          chmod +x dist/${{ matrix.target.outfile }}
+          ls -la dist/${{ matrix.target.outfile }}
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: binary-${{ matrix.target.name }}
+          path: dist/${{ matrix.target.outfile }}
+          retention-days: 1
+
+  publish-release:
+    name: Aggregate & Publish Release
+    needs: [prepare-meta, build-matrix]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download All Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      - name: Compute Checksums
+        working-directory: release-assets
+        run: |
+          ls -la
           sha256sum * > checksums.sha256
           cat checksums.sha256
 
-      - name: Create GitHub Release in server-bin
+      - name: Create Official GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ steps.vars.outputs.tag }}
-          name: "Proofline Server ${{ steps.vars.outputs.tag }}"
+          tag_name: ${{ needs.prepare-meta.outputs.tag }}
+          name: "Proofline Server ${{ needs.prepare-meta.outputs.tag }}"
           draft: false
           prerelease: false
+          generate_release_notes: true
           body: |
-            ## Distribucion Oficial de Binarios Ejecutables
+            ## Proofline Server — Official Standalone Binaries
 
-            Artefactos autocontenidos compilados directamente desde el repositorio privado `proofline-co/server`.
+            High-throughput, self-contained binary distribution compiled with Bun runtime.
+            Zero external Node.js runtime dependencies required.
 
-            ### Informacion de la Compilacion
-            - **Referencia del Codigo Fuente:** `${{ steps.vars.outputs.source_ref }}`
-            - **Numero de Ejecucion CI:** `${{ github.run_number }}`
-            - **Runtime Embebido:** Bun (ElysiaJS + TypeScript)
+            ### Build Info
+            - **Commit / Ref:** `${{ needs.prepare-meta.outputs.source_ref }}`
+            - **CI Run Number:** `${{ github.run_number }}`
+            - **Architecture Matrix:** Linux x64, Linux ARM64, Windows x64
 
-            ### Archivos Disponibles
-            - `proofline-server-linux-x64`: Binario nativo para servidores Linux de 64 bits.
-            - `proofline-server-linux-arm64`: Binario nativo para arquitecturas ARM (AWS Graviton, Raspberry Pi 4/5).
-            - `proofline-server-windows-x64.exe`: Ejecutable para entornos Windows Server / Windows 10+.
-            - `checksums.sha256`: Sumas de verificacion SHA-256 para validacion de integridad.
+            ### Verification
+            Validate integrity via `checksums.sha256`:
+            ```bash
+            sha256sum -c checksums.sha256
+            ```
           files: |
-            dist/proofline-server-linux-x64
-            dist/proofline-server-linux-arm64
-            dist/proofline-server-windows-x64.exe
-            dist/checksums.sha256
+            release-assets/*
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

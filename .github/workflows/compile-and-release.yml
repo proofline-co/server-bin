@@ -1,158 +1,134 @@
-name: Compile and Release Binaries (Optimized Matrix)
+name: Compile and Release
 
 on:
   repository_dispatch:
     types: [server-updated, server-release]
   workflow_dispatch:
     inputs:
-      tag_name:
-        description: "Release tag (e.g. v1.0.0)"
+      tag:
+        description: "Release tag"
         required: false
         default: ""
-      source_ref:
-        description: "Branch or commit in proofline-co/server to compile"
+      ref:
+        description: "Source git ref in proofline-co/server"
         required: false
         default: "main"
 
 concurrency:
-  group: release-${{ github.event.client_payload.ref || inputs.source_ref || github.ref }}
+  group: release-${{ github.event.client_payload.ref || inputs.ref || github.ref }}
   cancel-in-progress: true
 
 permissions:
   contents: write
 
 jobs:
-  prepare-meta:
-    name: Resolve Version & Metadata
+  resolve:
+    name: Resolve metadata
     runs-on: ubuntu-latest
     outputs:
       tag: ${{ steps.meta.outputs.tag }}
-      source_ref: ${{ steps.meta.outputs.source_ref }}
+      ref: ${{ steps.meta.outputs.ref }}
     steps:
       - id: meta
         run: |
-          if [ -n "${{ github.event.client_payload.tag }}" ]; then
-            TAG="${{ github.event.client_payload.tag }}"
-          elif [ -n "${{ inputs.tag_name }}" ]; then
-            TAG="${{ inputs.tag_name }}"
-          else
-            TAG="v$(date +'%Y.%m.%d').${{ github.run_number }}"
+          tag="${{ github.event.client_payload.tag || inputs.tag }}"
+          if [ -z "$tag" ]; then
+            tag="v$(date +'%Y.%m.%d').${{ github.run_number }}"
           fi
 
-          if [ -n "${{ github.event.client_payload.ref }}" ]; then
-            SOURCE_REF="${{ github.event.client_payload.ref }}"
-          elif [ -n "${{ inputs.source_ref }}" ]; then
-            SOURCE_REF="${{ inputs.source_ref }}"
-          else
-            SOURCE_REF="main"
-          fi
+          ref="${{ github.event.client_payload.ref || inputs.ref || 'main' }}"
 
-          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
-          echo "source_ref=${SOURCE_REF}" >> "$GITHUB_OUTPUT"
-          echo "Building: tag=${TAG}, source_ref=${SOURCE_REF}"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "ref=$ref" >> "$GITHUB_OUTPUT"
 
-  build-matrix:
-    name: Build (${{ matrix.target.name }})
-    needs: prepare-meta
+  build:
+    name: Build ${{ matrix.target.name }}
+    needs: resolve
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
         target:
-          - { name: "linux-x64", bun_target: "bun-linux-x64", outfile: "proofline-server-linux-x64" }
-          - { name: "linux-arm64", bun_target: "bun-linux-arm64", outfile: "proofline-server-linux-arm64" }
-          - { name: "windows-x64", bun_target: "bun-windows-x64", outfile: "proofline-server-windows-x64.exe" }
+          - { name: "linux-x64", bun: "bun-linux-x64", bin: "proofline-server-linux-x64" }
+          - { name: "linux-arm64", bun: "bun-linux-arm64", bin: "proofline-server-linux-arm64" }
+          - { name: "windows-x64", bun: "bun-windows-x64", bin: "proofline-server-windows-x64.exe" }
     steps:
-      - name: Checkout Source Repo
+      - name: Checkout source
         uses: actions/checkout@v4
         with:
           repository: proofline-co/server
-          ref: ${{ needs.prepare-meta.outputs.source_ref }}
+          ref: ${{ needs.resolve.outputs.ref }}
           token: ${{ secrets.SERVER_SOURCE_TOKEN || secrets.GH_PAT || secrets.GITHUB_TOKEN }}
-          path: source-repo
+          path: src
 
-      - name: Setup Bun with Cache
+      - name: Setup Bun
         uses: oven-sh/setup-bun@v2
         with:
           bun-version: latest
           cache: true
 
-      - name: Install & Run Test Suite
-        working-directory: source-repo
+      - name: Test
+        working-directory: src
         env:
           NODE_ENV: test
           DB_ENGINE: memory
         run: |
           bun install --frozen-lockfile || bun install
           if [ "${{ matrix.target.name }}" = "linux-x64" ]; then
-            echo "Running test suite once on primary runner..."
             bun test --parallel=1 --timeout 15000
           fi
 
-      - name: Compile Standalone Binary
-        working-directory: source-repo
+      - name: Compile
+        working-directory: src
         run: |
           mkdir -p ../dist
-          ENTRY=$(test -f ./apps/api/src/server.ts && echo "./apps/api/src/server.ts" || echo "./src/server.ts")
-          echo "Compiling for ${{ matrix.target.bun_target }} from $ENTRY..."
-          bun build --compile --minify --target=${{ matrix.target.bun_target }} "$ENTRY" --outfile ../dist/${{ matrix.target.outfile }}
+          entry="src/server.ts"
+          [ -f "apps/api/src/server.ts" ] && entry="apps/api/src/server.ts"
+          bun build --compile --minify --target=${{ matrix.target.bun }} "$entry" --outfile "../dist/${{ matrix.target.bin }}"
 
-      - name: Binary Smoke Check (Linux x64 only)
+      - name: Verify binary
         if: matrix.target.name == 'linux-x64'
         run: |
-          chmod +x dist/${{ matrix.target.outfile }}
-          ls -la dist/${{ matrix.target.outfile }}
+          chmod +x dist/${{ matrix.target.bin }}
+          test -x dist/${{ matrix.target.bin }}
 
-      - name: Upload Artifact
+      - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: binary-${{ matrix.target.name }}
-          path: dist/${{ matrix.target.outfile }}
+          name: ${{ matrix.target.name }}
+          path: dist/${{ matrix.target.bin }}
           retention-days: 1
 
-  publish-release:
-    name: Aggregate & Publish Release
-    needs: [prepare-meta, build-matrix]
+  release:
+    name: Publish release
+    needs: [resolve, build]
     runs-on: ubuntu-latest
     steps:
-      - name: Download All Artifacts
+      - name: Download artifacts
         uses: actions/download-artifact@v4
         with:
-          path: release-assets
+          path: dist
           merge-multiple: true
 
-      - name: Compute Checksums
-        working-directory: release-assets
+      - name: Checksums
+        working-directory: dist
         run: |
-          ls -la
           sha256sum * > checksums.sha256
           cat checksums.sha256
 
-      - name: Create Official GitHub Release
+      - name: Create release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ needs.prepare-meta.outputs.tag }}
-          name: "Proofline Server ${{ needs.prepare-meta.outputs.tag }}"
+          tag_name: ${{ needs.resolve.outputs.tag }}
+          name: "Proofline Server ${{ needs.resolve.outputs.tag }}"
           draft: false
           prerelease: false
           generate_release_notes: true
           body: |
-            ## Proofline Server — Official Standalone Binaries
-
-            High-throughput, self-contained binary distribution compiled with Bun runtime.
-            Zero external Node.js runtime dependencies required.
-
-            ### Build Info
-            - **Commit / Ref:** `${{ needs.prepare-meta.outputs.source_ref }}`
-            - **CI Run Number:** `${{ github.run_number }}`
-            - **Architecture Matrix:** Linux x64, Linux ARM64, Windows x64
-
-            ### Verification
-            Validate integrity via `checksums.sha256`:
-            ```bash
-            sha256sum -c checksums.sha256
-            ```
+            ### Standalone Binaries
+            Ref: `${{ needs.resolve.outputs.ref }}` (Build #${{ github.run_number }})
+            Verify with `sha256sum -c checksums.sha256`.
           files: |
-            release-assets/*
+            dist/*
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
